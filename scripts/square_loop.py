@@ -137,8 +137,10 @@ def design_square_loop_scene(scene_cfg: SquareTrackSceneCfg) -> None:
     )
     ground_cfg.func("/World/ground", ground_cfg)
 
-    light_cfg = sim_utils.DomeLightCfg(intensity=2600.0, color=(0.78, 0.78, 0.78))
+    light_cfg = sim_utils.DomeLightCfg(intensity=800.0, color=(0.95, 0.95, 0.95))
     light_cfg.func("/World/Light", light_cfg)
+    distant_light_cfg = sim_utils.DistantLightCfg(intensity=900.0, color=(1.0, 1.0, 1.0), angle=0.5)
+    distant_light_cfg.func("/World/SunLight", distant_light_cfg)
 
     floor_size = 2.0 * scene_cfg.floor_half_extent
     tape_span = 2.0 * scene_cfg.square_half_extent
@@ -210,6 +212,31 @@ def build_robot_camera_sensor(*, width: int, height: int) -> Camera:
         width=width,
         data_types=["rgb"],
         spawn=None,
+    )
+    return Camera(camera_cfg)
+
+
+def build_overhead_camera_sensor(
+    *,
+    width: int,
+    height: int,
+    prim_path: str = "/World/SpectatorOverhead",
+) -> Camera:
+    """Spawn a fixed top-down spectator camera prim. Caller must position it
+    via :meth:`Camera.set_world_poses_from_view` after :meth:`Camera.initialize`.
+    """
+    camera_cfg = CameraCfg(
+        prim_path=prim_path,
+        update_period=0.0,
+        height=height,
+        width=width,
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=14.0,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.05, 50.0),
+        ),
     )
     return Camera(camera_cfg)
 

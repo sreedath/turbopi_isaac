@@ -108,6 +108,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-height", type=int, default=DEFAULT_IMAGE_HEIGHT)
     parser.add_argument("--huber-delta", type=float, default=1.0)
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars")
+    parser.add_argument("--no-augment", action="store_true", help="Skip per-sample PIL augmentation (much faster, fine when collection already adds noise/jitter).")
+    parser.add_argument("--uniform-sampler", action="store_true", help="Use uniform random shuffling instead of WeightedRandomSampler (which biases toward turning frames).")
     return parser
 
 
@@ -139,6 +141,8 @@ def build_loaders(
     frame_history: int,
     image_width: int,
     image_height: int,
+    augment: bool = True,
+    uniform_sampler: bool = False,
 ) -> tuple[DataLoader, DataLoader | None, list[str], list[str]]:
     train_dataset, val_dataset = build_datasets(
         episodes_dir=episodes_dir,
@@ -146,12 +150,13 @@ def build_loaders(
         history=frame_history,
         val_ratio=val_ratio,
         seed=seed,
+        augment=augment,
     )
     if len(train_dataset) == 0:
         raise RuntimeError(f"No CNN episodes found under {episodes_dir}")
 
-    preload_threshold_frames = 25000
-    preload_threshold_records = 64
+    preload_threshold_frames = 250_000
+    preload_threshold_records = 1024
     if (
         train_dataset.records
         and len(train_dataset.records) <= preload_threshold_records
@@ -166,19 +171,29 @@ def build_loaders(
         if len(val_dataset.records) > 0:
             val_dataset.preload_all()
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        sampler=WeightedRandomSampler(
-            weights=torch.as_tensor(train_dataset.sample_weights, dtype=torch.double),
-            num_samples=len(train_dataset.sample_weights),
-            replacement=True,
-        ),
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
-    )
+    if uniform_sampler:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=num_workers > 0,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            sampler=WeightedRandomSampler(
+                weights=torch.as_tensor(train_dataset.sample_weights, dtype=torch.double),
+                num_samples=len(train_dataset.sample_weights),
+                replacement=True,
+            ),
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=num_workers > 0,
+        )
     val_loader = None
     if len(val_dataset) > 0:
         val_loader = DataLoader(
@@ -376,6 +391,8 @@ def main() -> None:
         frame_history=args.frame_history,
         image_width=args.image_width,
         image_height=args.image_height,
+        augment=not args.no_augment,
+        uniform_sampler=args.uniform_sampler,
     )
 
     model_config = LoopPolicyConfig(

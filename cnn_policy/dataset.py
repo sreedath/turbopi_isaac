@@ -238,11 +238,15 @@ class LoopEpisodeDataset(Dataset):
         }
 
     def _apply_transforms(self, frames: list[np.ndarray]) -> torch.Tensor:
-        pil_frames = [Image.fromarray(frame) for frame in frames]
         if self.augment:
+            pil_frames = [Image.fromarray(frame) for frame in frames]
             pil_frames = self._augment_frames(pil_frames)
-        tensors = [TF.to_tensor(frame) for frame in pil_frames]
-        return torch.cat(tensors, dim=0)
+            tensors = [TF.to_tensor(frame) for frame in pil_frames]
+            return torch.cat(tensors, dim=0)
+        # Fast no-augment path: stay in numpy/torch, skip PIL fixed-cost overhead
+        # which dominates at small image sizes.
+        arrs = [torch.from_numpy(frame).permute(2, 0, 1).contiguous().float().div_(255.0) for frame in frames]
+        return torch.cat(arrs, dim=0)
 
     def _augment_frames(self, frames: list[Image.Image]) -> list[Image.Image]:
         brightness = random.uniform(0.9, 1.1)
@@ -308,6 +312,8 @@ def build_datasets(
     history: int = DEFAULT_FRAME_HISTORY,
     val_ratio: float = 0.2,
     seed: int | None = None,
+    *,
+    augment: bool = True,
 ) -> tuple[LoopEpisodeDataset, LoopEpisodeDataset]:
     """Create train/val datasets with shared hyperparameters."""
     train_dataset = LoopEpisodeDataset(
@@ -315,7 +321,7 @@ def build_datasets(
         split="train",
         image_size=image_size,
         history=history,
-        augment=True,
+        augment=augment,
         val_ratio=val_ratio,
         seed=seed,
     )

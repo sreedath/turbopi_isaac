@@ -72,6 +72,39 @@ parser.add_argument("--disable_omega_feedback", dest="enable_omega_feedback", ac
 parser.add_argument("--omega_feedback_gain", type=float, default=2.0, help="Closed-loop yaw-rate feedback gain.")
 parser.add_argument("--omega_measure_alpha", type=float, default=0.2, help="EMA factor for measured yaw rate in the compensator.")
 parser.add_argument("--no_rollers", action="store_true", help="Skip procedural mecanum roller generation.")
+parser.add_argument("--save_video", type=str, default=None, help="Optional MP4 path. When set, every CNN-input frame is written with a predicted-action overlay.")
+parser.add_argument("--video_fps", type=float, default=0.0, help="MP4 fps. 0 means use --control_hz.")
+parser.add_argument(
+    "--save_external_video",
+    type=str,
+    default=None,
+    help="Optional MP4 path for the static spectator camera (overhead/isometric, controlled by --external_view).",
+)
+parser.add_argument(
+    "--save_chase_video",
+    type=str,
+    default=None,
+    help="Optional MP4 path for a third-person chase camera that follows the robot.",
+)
+parser.add_argument("--chase_video_width", type=int, default=1920)
+parser.add_argument("--chase_video_height", type=int, default=1080)
+parser.add_argument("--external_width", type=int, default=1920, help="External MP4 width.")
+parser.add_argument("--external_height", type=int, default=1080, help="External MP4 height.")
+parser.add_argument("--external_z", type=float, default=2.5, help="Height (m) of the overhead spectator camera (overhead view only).")
+parser.add_argument(
+    "--external_view",
+    type=str,
+    choices=("overhead", "isometric", "chase"),
+    default="isometric",
+    help="`overhead` = top-down. `isometric` = static corner 3/4 view (default). `chase` = third-person follow.",
+)
+parser.add_argument("--iso_eye_x", type=float, default=1.55, help="Isometric eye X (m).")
+parser.add_argument("--iso_eye_y", type=float, default=-1.55, help="Isometric eye Y (m).")
+parser.add_argument("--iso_eye_z", type=float, default=1.10, help="Isometric eye Z (m).")
+parser.add_argument("--chase_back", type=float, default=0.45)
+parser.add_argument("--chase_up", type=float, default=0.30)
+parser.add_argument("--chase_target_forward", type=float, default=0.30)
+parser.add_argument("--chase_target_up", type=float, default=0.05)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = True
@@ -87,7 +120,7 @@ import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
-from isaaclab.utils.math import euler_xyz_from_quat, quat_from_euler_xyz
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_from_euler_xyz
 
 from cnn_policy.drive import LoopPolicyRuntime, PolicyRuntimeConfig
 from common import (
@@ -106,6 +139,7 @@ from common import (
 )
 from square_loop import (
     SquareTrackSceneCfg,
+    build_overhead_camera_sensor,
     build_robot_camera_sensor,
     design_square_loop_scene,
     observe_track_state,
@@ -503,9 +537,35 @@ def main() -> None:
     design_square_loop_scene(scene_cfg)
     robot = spawn_turbopi(asset_usd=args_cli.asset_usd, add_rollers=not args_cli.no_rollers)
     camera = build_robot_camera_sensor(width=policy.image_width, height=policy.image_height)
+    overhead_camera = None
+    if args_cli.save_external_video:
+        overhead_camera = build_overhead_camera_sensor(
+            width=args_cli.external_width, height=args_cli.external_height
+        )
+    chase_camera = None
+    if args_cli.save_chase_video:
+        chase_camera = build_overhead_camera_sensor(
+            width=args_cli.chase_video_width,
+            height=args_cli.chase_video_height,
+            prim_path="/World/SpectatorChase",
+        )
 
     sim.reset()
     camera.update(dt=0.0)
+    if overhead_camera is not None:
+        if args_cli.external_view == "overhead":
+            eye = torch.tensor([[0.0, 0.0, float(args_cli.external_z)]], dtype=torch.float32, device=robot.device)
+            target = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32, device=robot.device)
+            overhead_camera.set_world_poses_from_view(eye, target)
+        elif args_cli.external_view == "isometric":
+            eye = torch.tensor([[args_cli.iso_eye_x, args_cli.iso_eye_y, args_cli.iso_eye_z]],
+                               dtype=torch.float32, device=robot.device)
+            target = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32, device=robot.device)
+            overhead_camera.set_world_poses_from_view(eye, target)
+        # chase mode is handled per-step in _write_external_frame
+        overhead_camera.update(dt=0.0)
+    if chase_camera is not None:
+        chase_camera.update(dt=0.0)
     sim.play()
 
     wheel_joint_ids = get_wheel_joint_ids(robot)
@@ -583,6 +643,138 @@ def main() -> None:
     last_low_image_warn_at = -1.0
     reset_count = 0
 
+    video_writer = None
+    video_fps = args_cli.video_fps if args_cli.video_fps > 0 else args_cli.control_hz
+    if args_cli.save_video:
+        import cv2 as _cv2
+        Path(args_cli.save_video).parent.mkdir(parents=True, exist_ok=True)
+        first_frame = reset_result.frame_rgb
+        h, w = first_frame.shape[:2]
+        video_writer = _cv2.VideoWriter(
+            args_cli.save_video,
+            _cv2.VideoWriter_fourcc(*"mp4v"),
+            float(video_fps),
+            (w, h),
+        )
+        if not video_writer.isOpened():
+            video_writer = None
+            print(f"[WARN] Could not open MP4 writer at {args_cli.save_video}; inference video disabled.", flush=True)
+        else:
+            print(f"[INFO] Recording inference MP4 to {args_cli.save_video} ({w}x{h} @ {video_fps:.1f} fps)", flush=True)
+
+    chase_writer = None
+    if args_cli.save_chase_video and chase_camera is not None:
+        import cv2 as _cv2
+        Path(args_cli.save_chase_video).parent.mkdir(parents=True, exist_ok=True)
+        chase_writer = _cv2.VideoWriter(
+            args_cli.save_chase_video,
+            _cv2.VideoWriter_fourcc(*"mp4v"),
+            float(video_fps),
+            (args_cli.chase_video_width, args_cli.chase_video_height),
+        )
+        if not chase_writer.isOpened():
+            chase_writer = None
+            print(f"[WARN] Could not open chase MP4 writer at {args_cli.save_chase_video}; chase video disabled.", flush=True)
+        else:
+            print(
+                f"[INFO] Recording chase MP4 to {args_cli.save_chase_video} "
+                f"({args_cli.chase_video_width}x{args_cli.chase_video_height} @ {video_fps:.1f} fps)",
+                flush=True,
+            )
+
+    external_writer = None
+    if args_cli.save_external_video and overhead_camera is not None:
+        import cv2 as _cv2
+        Path(args_cli.save_external_video).parent.mkdir(parents=True, exist_ok=True)
+        external_writer = _cv2.VideoWriter(
+            args_cli.save_external_video,
+            _cv2.VideoWriter_fourcc(*"mp4v"),
+            float(video_fps),
+            (args_cli.external_width, args_cli.external_height),
+        )
+        if not external_writer.isOpened():
+            external_writer = None
+            print(
+                f"[WARN] Could not open external MP4 writer at {args_cli.save_external_video}; external video disabled.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[INFO] Recording external MP4 to {args_cli.save_external_video} "
+                f"({args_cli.external_width}x{args_cli.external_height} @ {video_fps:.1f} fps)",
+                flush=True,
+            )
+
+    def _write_external_frame():
+        if external_writer is None or overhead_camera is None:
+            return
+        import cv2 as _cv2
+        try:
+            if args_cli.external_view == "chase":
+                base_pos = robot.data.root_pos_w[0]
+                base_quat = robot.data.root_quat_w[0]
+                eye_off = torch.tensor([[-args_cli.chase_back, 0.0, args_cli.chase_up]],
+                                       dtype=torch.float32, device=robot.device)
+                tgt_off = torch.tensor([[args_cli.chase_target_forward, 0.0, args_cli.chase_target_up]],
+                                       dtype=torch.float32, device=robot.device)
+                eye_w = quat_apply(base_quat.unsqueeze(0), eye_off) + base_pos.unsqueeze(0)
+                tgt_w = quat_apply(base_quat.unsqueeze(0), tgt_off) + base_pos.unsqueeze(0)
+                overhead_camera.set_world_poses_from_view(eye_w, tgt_w)
+            overhead_camera.update(dt=control_dt)
+            ext = overhead_camera.data.output.get("rgb")
+            if ext is None or ext.numel() == 0:
+                return
+            ext_np = ext[0, ..., :3].detach().cpu().numpy()
+            if ext_np.dtype != np.uint8:
+                if np.issubdtype(ext_np.dtype, np.floating):
+                    if ext_np.max() <= 1.0:
+                        ext_np = ext_np * 255.0
+                ext_np = np.clip(ext_np, 0, 255).astype(np.uint8)
+            external_writer.write(_cv2.cvtColor(ext_np, _cv2.COLOR_RGB2BGR))
+        except Exception:
+            pass
+
+    def _write_chase_frame():
+        if chase_writer is None or chase_camera is None:
+            return
+        import cv2 as _cv2
+        try:
+            base_pos = robot.data.root_pos_w[0]
+            base_quat = robot.data.root_quat_w[0]
+            eye_off = torch.tensor([[-args_cli.chase_back, 0.0, args_cli.chase_up]],
+                                   dtype=torch.float32, device=robot.device)
+            tgt_off = torch.tensor([[args_cli.chase_target_forward, 0.0, args_cli.chase_target_up]],
+                                   dtype=torch.float32, device=robot.device)
+            eye_w = quat_apply(base_quat.unsqueeze(0), eye_off) + base_pos.unsqueeze(0)
+            tgt_w = quat_apply(base_quat.unsqueeze(0), tgt_off) + base_pos.unsqueeze(0)
+            chase_camera.set_world_poses_from_view(eye_w, tgt_w)
+            chase_camera.update(dt=control_dt)
+            ext = chase_camera.data.output.get("rgb")
+            if ext is None or ext.numel() == 0:
+                return
+            ext_np = ext[0, ..., :3].detach().cpu().numpy()
+            if ext_np.dtype != np.uint8:
+                if np.issubdtype(ext_np.dtype, np.floating) and ext_np.max() <= 1.0:
+                    ext_np = ext_np * 255.0
+                ext_np = np.clip(ext_np, 0, 255).astype(np.uint8)
+            chase_writer.write(_cv2.cvtColor(ext_np, _cv2.COLOR_RGB2BGR))
+        except Exception:
+            pass
+
+    def _overlay_and_write(frame_rgb, pred_arr, command_arr, t, reset_count_val):
+        if video_writer is None:
+            return
+        import cv2 as _cv2
+        bgr = _cv2.cvtColor(frame_rgb, _cv2.COLOR_RGB2BGR).copy()
+        text_lines = [
+            f"t={t:5.1f}s fps={video_fps:.0f} resets={reset_count_val}",
+            f"pred [vx,vy,wz]=[{pred_arr[0]:+.2f},{pred_arr[1]:+.2f},{pred_arr[2]:+.2f}]",
+            f"cmd  [vx,vy,wz]=[{command_arr[0]:+.2f},{command_arr[1]:+.2f},{command_arr[2]:+.2f}]",
+        ]
+        for i, line in enumerate(text_lines):
+            _cv2.putText(bgr, line, (4, 12 + 12 * i), _cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, _cv2.LINE_AA)
+        video_writer.write(bgr)
+
     try:
         while simulation_app.is_running() and not stop_flag.requested:
             ensure_sim_playing(sim)
@@ -625,6 +817,9 @@ def main() -> None:
                     )
 
             pred, smoothed, command_np = policy.predict(frame_rgb)
+            _overlay_and_write(frame_rgb, pred, command_np, elapsed, reset_count)
+            _write_external_frame()
+            _write_chase_frame()
             command_t = torch.as_tensor(command_np, dtype=torch.float32, device=robot.device)
             ok, pose = step_control(
                 sim=sim,
@@ -677,6 +872,15 @@ def main() -> None:
             )
         except Exception:
             pass
+        if video_writer is not None:
+            video_writer.release()
+            print(f"[INFO] Inference MP4 saved to {args_cli.save_video}")
+        if external_writer is not None:
+            external_writer.release()
+            print(f"[INFO] External MP4 saved to {args_cli.save_external_video}")
+        if chase_writer is not None:
+            chase_writer.release()
+            print(f"[INFO] Chase MP4 saved to {args_cli.save_chase_video}")
         print()
         print(f"[INFO] CNN drive finished after {elapsed:.1f}s with {reset_count} resets.")
 

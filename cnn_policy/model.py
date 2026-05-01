@@ -19,8 +19,12 @@ class LoopPolicyConfig:
     image_height: int = DEFAULT_IMAGE_HEIGHT
     frame_history: int = DEFAULT_FRAME_HISTORY
     action_dim: int = 3
-    hidden_dim: int = 64
+    hidden_dim: int = 32
     dropout: float = 0.1
+    # Channel widths for the 4 conv blocks. Defaults total ~60k params for
+    # the (frame_history=3, image=64x48) configuration. Bump for more capacity.
+    conv_channels: tuple[int, int, int, int] = (16, 32, 56, 64)
+    head_dims: tuple[int, int] = (32, 16)
 
     @property
     def input_channels(self) -> int:
@@ -48,21 +52,23 @@ class LoopPolicyNet(nn.Module):
     def __init__(self, config: LoopPolicyConfig | None = None):
         super().__init__()
         self.config = config or LoopPolicyConfig()
+        c1, c2, c3, c4 = self.config.conv_channels
         self.encoder = nn.Sequential(
-            ConvBlock(self.config.input_channels, 32, kernel_size=5, stride=2, padding=2),
-            ConvBlock(32, 64, kernel_size=3, stride=2, padding=1),
-            ConvBlock(64, 128, kernel_size=3, stride=2, padding=1),
-            ConvBlock(128, 128, kernel_size=3, stride=2, padding=1),
+            ConvBlock(self.config.input_channels, c1, kernel_size=5, stride=2, padding=2),
+            ConvBlock(c1, c2, kernel_size=3, stride=2, padding=1),
+            ConvBlock(c2, c3, kernel_size=3, stride=2, padding=1),
+            ConvBlock(c3, c4, kernel_size=3, stride=2, padding=1),
             nn.AdaptiveAvgPool2d((1, 1)),
         )
+        h1, h2 = self.config.head_dims
         self.head = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128, self.config.hidden_dim),
+            nn.Linear(c4, h1),
             nn.ReLU(inplace=True),
             nn.Dropout(self.config.dropout),
-            nn.Linear(self.config.hidden_dim, 32),
+            nn.Linear(h1, h2),
             nn.ReLU(inplace=True),
-            nn.Linear(32, self.config.action_dim),
+            nn.Linear(h2, self.config.action_dim),
             nn.Tanh(),
         )
 
