@@ -40,10 +40,14 @@ parser.add_argument("--omega_cap", type=float, default=2.0)
 parser.add_argument("--min_vx", type=float, default=0.0)
 parser.add_argument("--min_vy", type=float, default=0.0)
 parser.add_argument("--min_omega", type=float, default=0.0)
-parser.add_argument("--fall_margin", type=float, default=0.25, help="Stop if robot z drops this far below road height.")
+parser.add_argument("--fall_margin", type=float, default=0.25, help="Fall detection margin below road height.")
+parser.add_argument("--continue_after_fall", action="store_true", help="Keep recording until --duration even after a fall.")
 parser.add_argument("--no_rollers", action="store_true")
 parser.add_argument("--save_video", type=str, default=None)
 parser.add_argument("--video_fps", type=float, default=0.0)
+parser.add_argument("--save_external_video", type=str, default=None)
+parser.add_argument("--external_width", type=int, default=1920)
+parser.add_argument("--external_height", type=int, default=1080)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = True
@@ -120,6 +124,23 @@ def build_robot_camera_sensor(*, width: int, height: int) -> Camera:
     return Camera(camera_cfg)
 
 
+def build_external_camera_sensor(*, width: int, height: int, prim_path: str = "/World/CliffInferenceCamera") -> Camera:
+    camera_cfg = CameraCfg(
+        prim_path=prim_path,
+        update_period=0.0,
+        height=height,
+        width=width,
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=18.0,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.05, 100.0),
+        ),
+    )
+    return Camera(camera_cfg)
+
+
 def rgb_frame(camera: Camera) -> np.ndarray:
     image = camera.data.output["rgb"]
     if image is None or image.numel() == 0:
@@ -138,6 +159,16 @@ def rgb_frame(camera: Camera) -> np.ndarray:
 
 def image_std_rgb(image_rgb: np.ndarray) -> float:
     return float(np.asarray(image_rgb, dtype=np.float32).std())
+
+
+def write_camera_frame(video_writer, camera: Camera) -> None:
+    if video_writer is None:
+        return
+    try:
+        frame = rgb_frame(camera)
+        video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    except Exception:
+        return
 
 
 def set_isometric_camera(sim: sim_utils.SimulationContext, viewport, scene_cfg: CliffRoadSceneCfg) -> str:
@@ -218,9 +249,13 @@ def step_control(
     control_mode: str,
     pose: tuple[float, float, float],
     root_z: float,
+    external_camera=None,
+    external_writer=None,
+    external_write_every: int = 1,
 ) -> tuple[bool, tuple[float, float, float]]:
     current_pose = pose
-    for _ in range(substeps):
+    write_every = max(1, int(external_write_every))
+    for substep_index in range(substeps):
         if not simulation_app.is_running():
             return False, current_pose
         ensure_sim_playing(sim)
@@ -231,6 +266,9 @@ def step_control(
             apply_dynamic_command(robot, wheel_joint_ids, arm_joint_ids, command_vec)
         sim.step()
         robot.update(physics_dt)
+        if external_camera is not None and substep_index % write_every == 0:
+            external_camera.update(dt=physics_dt)
+            write_camera_frame(external_writer, external_camera)
         if active_view == "chase":
             update_chase_camera(robot, viewport)
         if control_mode == "dynamic":
@@ -274,11 +312,20 @@ def main() -> None:
     robot = spawn_turbopi(asset_usd=args_cli.asset_usd, add_rollers=not args_cli.no_rollers)
     set_robot_camera_mount(CLIFF_CAMERA_POS, CLIFF_CAMERA_ROT)
     camera = build_robot_camera_sensor(width=runtime.image_width, height=runtime.image_height)
+    external_camera = None
+    if args_cli.save_external_video:
+        external_camera = build_external_camera_sensor(width=args_cli.external_width, height=args_cli.external_height)
 
     sim.reset()
     start_position, start_yaw = start_pose(scene_cfg)
     root_z = scene_cfg.cliff_height + scene_cfg.start_height
     reset_robot_pose(robot, position=(start_position[0], start_position[1], root_z), yaw=start_yaw)
+    if external_camera is not None:
+        external_camera.set_world_poses_from_view(
+            torch.tensor([[1.85, -2.25, scene_cfg.cliff_height + 1.10]], dtype=torch.float32, device=robot.device),
+            torch.tensor([[0.0, -0.15, scene_cfg.cliff_height - 0.10]], dtype=torch.float32, device=robot.device),
+        )
+        external_camera.update(dt=0.0)
     sim.play()
 
     wheel_joint_ids = get_wheel_joint_ids(robot)
@@ -296,6 +343,8 @@ def main() -> None:
             sim=sim,
             robot=robot,
             camera=camera,
+            external_camera=None,
+            external_writer=None,
             wheel_joint_ids=wheel_joint_ids,
             arm_joint_ids=arm_joint_ids,
             command_vec=(0.0, 0.0, 0.0),
@@ -317,6 +366,8 @@ def main() -> None:
             sim=sim,
             robot=robot,
             camera=camera,
+            external_camera=None,
+            external_writer=None,
             wheel_joint_ids=wheel_joint_ids,
             arm_joint_ids=arm_joint_ids,
             command_vec=(0.0, 0.0, 0.0),
@@ -359,6 +410,31 @@ def main() -> None:
             video_writer = None
             print(f"[WARN] Could not open video writer for {video_path}", flush=True)
 
+    external_writer = None
+    external_write_every = 1
+    if args_cli.save_external_video and external_camera is not None:
+        external_path = Path(args_cli.save_external_video)
+        external_path.parent.mkdir(parents=True, exist_ok=True)
+        fps = float(args_cli.video_fps if args_cli.video_fps > 0.0 else args_cli.control_hz)
+        physics_fps = 1.0 / max(physics_dt, 1e-9)
+        external_write_every = max(1, int(round(physics_fps / max(fps, 1e-6))))
+        external_writer = cv2.VideoWriter(
+            str(external_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (args_cli.external_width, args_cli.external_height),
+        )
+        if not external_writer.isOpened():
+            external_writer.release()
+            external_writer = None
+            print(f"[WARN] Could not open external video writer for {external_path}", flush=True)
+        else:
+            print(
+                f"[INFO] Recording external MP4 to {external_path} "
+                f"({args_cli.external_width}x{args_cli.external_height})",
+                flush=True,
+            )
+
     stop_flag = StopFlag()
     signal.signal(signal.SIGINT, stop_flag.request)
     signal.signal(signal.SIGTERM, stop_flag.request)
@@ -378,6 +454,7 @@ def main() -> None:
 
     elapsed = 0.0
     step_index = 0
+    fall_reported = False
     try:
         while simulation_app.is_running() and not stop_flag.requested:
             frame = rgb_frame(camera)
@@ -391,6 +468,8 @@ def main() -> None:
                 sim=sim,
                 robot=robot,
                 camera=camera,
+                external_camera=external_camera,
+                external_writer=external_writer,
                 wheel_joint_ids=wheel_joint_ids,
                 arm_joint_ids=arm_joint_ids,
                 command_vec=command_vec,
@@ -401,14 +480,19 @@ def main() -> None:
                 control_mode=args_cli.control_mode,
                 pose=pose,
                 root_z=root_z,
+                external_write_every=external_write_every,
             )
             if not ok:
                 break
 
             z = float(robot.data.root_pos_w[0, 2].item())
             if z < scene_cfg.cliff_height - args_cli.fall_margin:
-                print(f"[INFO] Robot fell below road height: z={z:.2f}. Stopping.", flush=True)
-                break
+                if not fall_reported:
+                    action = "Continuing recording." if args_cli.continue_after_fall else "Stopping."
+                    print(f"[INFO] Robot fell below road height: z={z:.2f}. {action}", flush=True)
+                    fall_reported = True
+                if not args_cli.continue_after_fall:
+                    break
 
             elapsed += control_dt
             step_index += 1
@@ -425,6 +509,8 @@ def main() -> None:
     finally:
         if video_writer is not None:
             video_writer.release()
+        if external_writer is not None:
+            external_writer.release()
 
 
 def close_app_and_exit(exit_code: int = 0) -> None:

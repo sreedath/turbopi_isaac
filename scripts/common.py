@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -198,7 +199,7 @@ def design_basic_scene() -> None:
 
 
 def _set_camera_common_attrs(camera: UsdGeom.Camera) -> None:
-    camera.CreateFocalLengthAttr(8.5)
+    camera.CreateFocalLengthAttr(13.0)
     camera.CreateFocusDistanceAttr(400.0)
     camera.CreateHorizontalApertureAttr(10.0)
     camera.CreateVerticalApertureAttr(7.5)
@@ -306,8 +307,9 @@ def update_chase_camera(
     robot: Articulation,
     viewport,
     camera_path: str = CHASE_CAMERA_PATH,
-    eye_offset: tuple[float, float, float] = (-0.8, 0.0, 0.34),
-    target_offset: tuple[float, float, float] = (0.22, 0.0, 0.10),
+    eye_offset: tuple[float, float, float] = (-1.65, -0.08, 0.72),
+    target_offset: tuple[float, float, float] = (0.85, 0.02, 0.08),
+    yaw_only: bool = True,
 ) -> None:
     """Update the chase camera to follow the robot base."""
     if viewport is None:
@@ -321,8 +323,34 @@ def update_chase_camera(
     eye_offset_t = torch.tensor([eye_offset], dtype=torch.float32, device=robot.device)
     target_offset_t = torch.tensor([target_offset], dtype=torch.float32, device=robot.device)
 
-    eye_world = quat_apply(base_quat.unsqueeze(0), eye_offset_t)[0] + base_pos
-    target_world = quat_apply(base_quat.unsqueeze(0), target_offset_t)[0] + base_pos
+    if yaw_only:
+        w, x, y, z = [float(value.item()) for value in base_quat]
+        yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        eye_local = eye_offset_t[0]
+        target_local = target_offset_t[0]
+        eye_world = base_pos + torch.tensor(
+            [
+                cos_yaw * eye_local[0] - sin_yaw * eye_local[1],
+                sin_yaw * eye_local[0] + cos_yaw * eye_local[1],
+                eye_local[2],
+            ],
+            dtype=torch.float32,
+            device=robot.device,
+        )
+        target_world = base_pos + torch.tensor(
+            [
+                cos_yaw * target_local[0] - sin_yaw * target_local[1],
+                sin_yaw * target_local[0] + cos_yaw * target_local[1],
+                target_local[2],
+            ],
+            dtype=torch.float32,
+            device=robot.device,
+        )
+    else:
+        eye_world = quat_apply(base_quat.unsqueeze(0), eye_offset_t)[0] + base_pos
+        target_world = quat_apply(base_quat.unsqueeze(0), target_offset_t)[0] + base_pos
 
     camera_state = ViewportCameraState(camera_path, viewport)
     camera_state.set_position_world(
