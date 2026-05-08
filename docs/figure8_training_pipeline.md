@@ -447,6 +447,16 @@ The pose-based audit plots are:
 /workspace/turbopi_isaac/outputs/figure8_diverse_expert_path_audit/figure8_expert_paths_summary.csv
 ```
 
+The same audit artifacts are also versioned in Git for later slide/report generation:
+
+```text
+docs/experiment_artifacts/figure8_diverse_experts/README.md
+docs/experiment_artifacts/figure8_diverse_experts/figure8_expert_paths_on_topdown_map.png
+docs/experiment_artifacts/figure8_diverse_experts/figure8_expert_paths_overlay.png
+docs/experiment_artifacts/figure8_diverse_experts/figure8_expert_progress_projection.png
+docs/experiment_artifacts/figure8_diverse_experts/figure8_expert_paths_summary.csv
+```
+
 Important note: an earlier command-integration plot from the old dataset did not line up with the route because it reconstructed pose by integrating only the saved frame commands. Segment-transition control steps were applied in simulation but were not saved as frames, so command-only reconstruction was not a reliable pose audit. The new diverse dataset writes actual pose columns and the final audit plots use those saved poses directly.
 
 ## ACT + CVAE + Language Intent Training
@@ -710,6 +720,7 @@ duration: 30.00 s
 - Completed ACT + CVAE + language-intent training on the 64-episode vectorized figure-8 dataset.
 - Rendered 30-second 1920x1080 chase-camera inference videos for `go_left` and `go_right`.
 - Added pose columns to the vectorized collector and collected a 128-episode diverse expert dataset with pose-based top-down audit plots.
+- Versioned the diverse expert audit plots and summary CSV under `docs/experiment_artifacts/figure8_diverse_experts/` for later slides.
 
 ## Next Sections To Add
 
