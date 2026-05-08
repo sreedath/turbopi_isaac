@@ -32,6 +32,12 @@ The original cloned mountain route is preserved as the `original` map. The figur
   - Launches separate headless Isaac workers for left and right data collection.
   - This is the fast path for generating balanced left/right data without manual interaction.
 
+- `scripts/record_turbopi_figure8_act_vec.py`
+  - Runs vectorized figure-8 ACT collection in one Isaac Lab process.
+  - Clones many figure-8 arenas with one TurboPi and one robot camera per environment.
+  - Uses batched route following and per-environment resets.
+  - This is the preferred fast path for future collection.
+
 - `scripts/act_mountain_dataset.py`
   - Writes each episode as `video.mp4`, `data.parquet`, and `episode_info.json`.
   - Session metadata records the map name and laps per episode.
@@ -237,22 +243,38 @@ Expected scale:
 
 Rendering is the main bottleneck. Physics is cheap because the teacher uses kinematic root updates; the expensive part is generating many camera images. For the fastest run, use lower camera resolution such as `64x48` or `96x72` first, then increase to `128x128` once throughput is confirmed.
 
-Planned vectorized command shape:
+Implemented vectorized command:
 
 ```bash
 cd /workspace/isaaclab
 ./isaaclab.sh -p /workspace/turbopi_isaac/scripts/record_turbopi_figure8_act_vec.py \
   --headless \
   --num_envs 64 \
-  --num_episodes 100 \
+  --num_episodes 64 \
   --laps 3 \
   --image_width 96 \
   --image_height 72 \
-  --output_dir /workspace/turbopi_isaac/data/act_figure8_vec \
-  --no_onboard_video
+  --output_dir /workspace/turbopi_isaac/data/act_figure8_vec_64 \
+  --session_name figure8_vec_64 \
+  --max_episode_time 90
 ```
 
-For training data, disabling per-episode MP4 writing is important at this scale. The collector should write parquet action metadata and either encoded image batches or videos only when needed for inspection. MP4 encoding can become a CPU bottleneck when many environments finish at the same time.
+Observed result from the first 64-episode vectorized run:
+
+```text
+output: /workspace/turbopi_isaac/data/act_figure8_vec_64/figure8_vec_64
+episodes: 64
+left intent: 32
+right intent: 32
+failures: 0
+total frames: 23,474
+mean frames per episode: 366.8
+image size: 96x72
+laps per episode: 3
+dataset size on disk: about 12 MB
+```
+
+For larger training data, consider disabling per-episode MP4 writing or storing image chunks directly. MP4 encoding can become a CPU bottleneck when many environments finish at the same time. The current implementation still writes `video.mp4` per episode because the existing ACT dataset format stores robot-camera images there.
 
 ## Single-Worker Commands
 
@@ -348,7 +370,8 @@ The RGB frames are stored in `video.mp4`.
 - Added `--laps`, defaulting to three loops per episode.
 - Added per-episode speed, start pose, and camera jitter.
 - Added `scripts/collect_figure8_act_parallel.sh` for balanced parallel left/right collection.
-- Added a two-minute target design note: the next implementation should be a vectorized `InteractiveScene` collector, not more standalone Isaac processes.
+- Added a two-minute target design note explaining why the fast path should be a vectorized `InteractiveScene` collector, not more standalone Isaac processes.
+- Added `scripts/record_turbopi_figure8_act_vec.py` and collected a 64-episode vectorized dataset with 32 left and 32 right episodes.
 
 ## Next Sections To Add
 
