@@ -37,6 +37,12 @@ parser.add_argument("--video_fps", type=float, default=30.0)
 parser.add_argument("--video_output_dir", type=str, default=None, help="Optional directory for multi-view inference MP4s.")
 parser.add_argument("--video_width", type=int, default=1920)
 parser.add_argument("--video_height", type=int, default=1080)
+parser.add_argument(
+    "--video_views",
+    type=str,
+    default="robot,chase,isometric",
+    help="Comma-separated video views to record. Choices: robot,chase,isometric.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = True
@@ -124,7 +130,17 @@ def build_camera(
     )
 
 
-def build_video_cameras(width: int, height: int) -> dict[str, Camera]:
+def parse_video_views(views_arg: str) -> tuple[str, ...]:
+    views = tuple(view.strip() for view in views_arg.split(",") if view.strip())
+    unknown = tuple(view for view in views if view not in VIDEO_VIEWS)
+    if unknown:
+        raise ValueError(f"Unknown video view(s): {', '.join(unknown)}. Valid views: {', '.join(VIDEO_VIEWS)}")
+    if not views:
+        raise ValueError("At least one video view must be selected.")
+    return views
+
+
+def build_video_cameras(width: int, height: int, views: tuple[str, ...]) -> dict[str, Camera]:
     return {
         view: build_camera(
             width,
@@ -132,7 +148,7 @@ def build_video_cameras(width: int, height: int) -> dict[str, Camera]:
             prim_path=f"{VIDEO_CAMERA_ROOT}_{view}",
             focal_length=20.0,
         )
-        for view in VIDEO_VIEWS
+        for view in views
     }
 
 
@@ -208,13 +224,13 @@ def update_video_cameras(video_cameras: dict[str, Camera] | None, robot, scene_c
         update_video_camera(video_camera, robot, scene_cfg, view, dt)
 
 
-def open_video_writers(task_name: str) -> dict[str, cv2.VideoWriter]:
+def open_video_writers(task_name: str, views: tuple[str, ...]) -> dict[str, cv2.VideoWriter]:
     if not args_cli.video_output_dir:
         return {}
     video_dir = Path(args_cli.video_output_dir)
     video_dir.mkdir(parents=True, exist_ok=True)
     writers: dict[str, cv2.VideoWriter] = {}
-    for view in VIDEO_VIEWS:
+    for view in views:
         path = video_dir / f"mountain_act_inference_{task_name}_{view}_{args_cli.video_width}x{args_cli.video_height}.mp4"
         writer = cv2.VideoWriter(
             str(path),
@@ -312,7 +328,8 @@ def main() -> None:
     robot = spawn_turbopi(asset_usd=args_cli.asset_usd, add_rollers=not args_cli.no_rollers)
     set_robot_camera_mount(CAMERA_POS, CAMERA_ROT)
     camera = build_camera(runtime.image_width, runtime.image_height)
-    video_cameras = build_video_cameras(args_cli.video_width, args_cli.video_height) if args_cli.video_output_dir else None
+    video_views = parse_video_views(args_cli.video_views)
+    video_cameras = build_video_cameras(args_cli.video_width, args_cli.video_height, video_views) if args_cli.video_output_dir else None
     sim.reset()
     start_position, start_yaw = start_pose(scene_cfg)
     root_z = scene_cfg.road_z + scene_cfg.start_height
@@ -342,7 +359,7 @@ def main() -> None:
         path = Path(args_cli.save_video)
         path.parent.mkdir(parents=True, exist_ok=True)
         writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), args_cli.video_fps, (runtime.image_width, runtime.image_height))
-    video_writers = open_video_writers(args_cli.task)
+    video_writers = open_video_writers(args_cli.task, video_views)
     stop_flag = StopFlag()
     signal.signal(signal.SIGINT, stop_flag.request)
     signal.signal(signal.SIGTERM, stop_flag.request)

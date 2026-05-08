@@ -363,6 +363,255 @@ episode_00001/
 
 The RGB frames are stored in `video.mp4`.
 
+## ACT + CVAE + Language Intent Training
+
+The training script is:
+
+```text
+train_turbopi_mountain_act.py
+```
+
+It calls:
+
+```text
+act_policy.train.main()
+```
+
+The current figure-8 training command is:
+
+```bash
+cd /workspace/turbopi_isaac
+/workspace/isaaclab/_isaac_sim/python.sh train_turbopi_mountain_act.py \
+  --episodes-dir /workspace/turbopi_isaac/data/act_figure8_vec_64/figure8_vec_64 \
+  --run-dir runs/figure8_act_cvae \
+  --epochs 40 \
+  --batch-size 128 \
+  --num-workers 0 \
+  --device cuda \
+  --no-progress
+```
+
+`--num-workers 0` is intentional in this container. The shared-memory mount is small, and PyTorch video-decoding workers can otherwise fail with shared-memory bus errors.
+
+### Dataset Used For This Training Run
+
+The first vectorized figure-8 dataset has:
+
+```text
+dataset path: /workspace/turbopi_isaac/data/act_figure8_vec_64/figure8_vec_64
+episodes: 64
+left intent episodes: 32
+right intent episodes: 32
+failures during collection: 0
+total frames: 23,474
+mean frames per episode: 366.8
+camera source: robot_forward
+stored camera resolution: 96x72
+model input resolution: 128x128
+control rate: 10 Hz
+laps per episode: 3
+```
+
+Each training sample is built from one timestep:
+
+- Input image: robot-forward RGB frame from `video.mp4`.
+- Intent: task id from `data.parquet`, mapped from `go_left` or `go_right`.
+- Target: future action chunk from `data.parquet["action"]`.
+
+The action chunk length is `5`, so the model predicts five future actions from the current image and intent. At `10 Hz`, that chunk covers about `0.5 s` of future control.
+
+### Architecture
+
+The model is `LanguageConditionedACTCVAE` in `act_policy/model.py`.
+
+High-level structure:
+
+```text
+robot camera image
+  -> CNN image encoder
+  -> 64 spatial tokens, each 64-dim
+
+language intent id
+  -> learned embedding
+  -> 1 language token, 64-dim
+
+future action chunk during training
+  -> CVAE encoder
+  -> latent z distribution
+  -> sampled z token, 64-dim
+
+spatial tokens + language token + z token
+  -> transformer encoder
+  -> transformer decoder with 5 learned action queries
+  -> 5 predicted actions
+```
+
+The language conditioning is currently task-id based:
+
+```text
+go_left  -> task index 0
+go_right -> task index 1
+```
+
+Those ids are embedded into learned 64-dimensional vectors. This is sufficient for the current two-intent setup. If we later want open-vocabulary natural language, the language-token block can be replaced with a text encoder while keeping the ACT/CVAE action decoder structure.
+
+### CVAE Loss
+
+During training, the model sees the ground-truth future action chunk. The CVAE encoder maps:
+
+```text
+ground-truth action chunk + language token -> latent distribution
+```
+
+It predicts:
+
+```text
+mu, logvar
+```
+
+Then the model samples:
+
+```text
+z = mu + eps * std
+```
+
+The total loss is:
+
+```text
+SmoothL1(predicted_action_chunk, target_action_chunk)
++ kl_weight * KL(q(z | action, language) || N(0, I))
+```
+
+Current training uses:
+
+```text
+kl_weight = 0.01
+optimizer = AdamW
+learning rate = 3e-4
+weight decay = 1e-4
+epochs = 40
+batch size = 128
+```
+
+At inference time, the future action chunk is not available. The runtime uses `z = 0`, plus the image and language intent, to predict the next action chunk.
+
+### Checkpoints
+
+Training writes:
+
+```text
+runs/figure8_act_cvae/run_<timestamp>/
+  checkpoints/
+    last.pt
+    best.pt
+  training_summary.json
+```
+
+`best.pt` is selected by validation loss if a validation split exists; otherwise it follows the training loss. Because the current 64-episode dataset is one session, the current loader treats all episodes as training records and has no separate validation session. For better validation, future collection should write at least two sessions or the dataset splitter should support episode-level splitting within one session.
+
+### Current Training Result
+
+The completed training run is:
+
+```text
+runs/figure8_act_cvae/run_20260508_070640
+```
+
+It finished all `40` epochs. The final logged loss was:
+
+```text
+epoch 040
+train_loss = 0.0132
+val_loss = nan
+best_epoch = 40
+```
+
+The `val_loss` is `nan` only because there was no validation split for this one-session dataset. The checkpoint used for inference is:
+
+```text
+runs/figure8_act_cvae/run_20260508_070640/checkpoints/best.pt
+```
+
+## Inference Video Rendering
+
+The inference script is:
+
+```text
+scripts/drive_turbopi_mountain_act.py
+```
+
+It loads the trained checkpoint, builds the default `figure8` map, attaches the policy camera for the model input, and can attach separate high-resolution cameras for rendering. For the requested outputs, only the chase camera was recorded by passing:
+
+```text
+--video_views chase
+```
+
+This keeps the render focused on the deliverable videos instead of also writing robot and isometric views. The script default remains unchanged: without `--video_views`, it records `robot`, `chase`, and `isometric`.
+
+The video runs used kinematic control:
+
+```text
+--control_mode kinematic
+```
+
+That matches the vectorized collector, where the expert trajectory directly integrates commanded planar velocity. The model still receives the onboard policy camera image and language intent; the chase camera is only for human-readable video output.
+
+### Left-Intent Video Command
+
+```bash
+cd /workspace/turbopi_isaac
+TERM=xterm /workspace/isaaclab/isaaclab.sh -p /workspace/turbopi_isaac/scripts/drive_turbopi_mountain_act.py \
+  --headless \
+  --checkpoint /workspace/turbopi_isaac/runs/figure8_act_cvae/run_20260508_070640/checkpoints/best.pt \
+  --task go_left \
+  --view chase \
+  --duration 30 \
+  --control_mode kinematic \
+  --no_rollers \
+  --video_output_dir /workspace/turbopi_isaac/inference_videos/figure8_act_1080 \
+  --video_width 1920 \
+  --video_height 1080 \
+  --video_fps 10 \
+  --video_views chase
+```
+
+### Right-Intent Video Command
+
+```bash
+cd /workspace/turbopi_isaac
+TERM=xterm /workspace/isaaclab/isaaclab.sh -p /workspace/turbopi_isaac/scripts/drive_turbopi_mountain_act.py \
+  --headless \
+  --checkpoint /workspace/turbopi_isaac/runs/figure8_act_cvae/run_20260508_070640/checkpoints/best.pt \
+  --task go_right \
+  --view chase \
+  --duration 30 \
+  --control_mode kinematic \
+  --no_rollers \
+  --video_output_dir /workspace/turbopi_isaac/inference_videos/figure8_act_1080 \
+  --video_width 1920 \
+  --video_height 1080 \
+  --video_fps 10 \
+  --video_views chase
+```
+
+The videos are:
+
+```text
+/workspace/turbopi_isaac/inference_videos/figure8_act_1080/mountain_act_inference_go_left_chase_1920x1080.mp4
+/workspace/turbopi_isaac/inference_videos/figure8_act_1080/mountain_act_inference_go_right_chase_1920x1080.mp4
+```
+
+Both videos were verified as:
+
+```text
+resolution: 1920x1080
+frames: 300
+fps: 10
+duration: 30.00 s
+```
+
+`--video_fps 10` is deliberate because the inference loop writes one frame per `10 Hz` control step. Using `10 fps` makes the MP4 duration match the 30 seconds of simulated driving. If the control loop is later changed to write frames at render rate, this value should be revisited.
+
 ## Update Log
 
 - Added the `figure8` alternate map while preserving `original`.
@@ -372,13 +621,11 @@ The RGB frames are stored in `video.mp4`.
 - Added `scripts/collect_figure8_act_parallel.sh` for balanced parallel left/right collection.
 - Added a two-minute target design note explaining why the fast path should be a vectorized `InteractiveScene` collector, not more standalone Isaac processes.
 - Added `scripts/record_turbopi_figure8_act_vec.py` and collected a 64-episode vectorized dataset with 32 left and 32 right episodes.
+- Completed ACT + CVAE + language-intent training on the 64-episode vectorized figure-8 dataset.
+- Rendered 30-second 1920x1080 chase-camera inference videos for `go_left` and `go_right`.
 
 ## Next Sections To Add
 
 When implemented, extend this document with:
 
-- Training commands and dataset selection.
-- Model checkpoint layout.
-- Inference commands on the figure-8 map.
-- How to export and download inference videos.
 - Recommended figures for reports or slides.
